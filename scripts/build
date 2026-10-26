@@ -1,0 +1,239 @@
+"""
+build.py - Build script for AWR2944 mmWave Radar Safety Firmware
+
+Invokes the TI ARM CGT compiler and linker to build the firmware image.
+Supports multiple configurations and safety levels.
+
+Usage:
+    python build.py --target awr2944 --config release --safety-level asil-d
+    python build.py --clean
+    python build.py --test unit
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import shutil
+from pathlib import Path
+
+
+# Project configuration
+PROJECT_NAME = "awr2944_fw"
+BUILD_DIR = Path("build")
+SRC_DIR = Path("src")
+ASM_DIR = Path("asm")
+INCLUDE_DIR = Path("include")
+LINKER_DIR = Path("linker")
+
+# Toolchain defaults
+DEFAULT_CGT_PATH = os.environ.get("TI_CGT_PATH", "/opt/ti/ti-cgt-arm_20.2.7.LTS")
+DEFAULT_GNU_PREFIX = "arm-none-eabi-"
+
+# Source files
+C_SOURCES = [
+    "src/main.c",
+    "src/startup/startup_r5f.c",
+    "src/safety/safety_monitor.c",
+    "src/safety/fault_handler.c",
+    "src/safety/diagnostic_coverage.c",
+    "src/safety/watchdog.c",
+    "src/safety/ecc_handler.c",
+    "src/safety/lockstep_monitor.c",
+    "src/safety/crc_e2e.c",
+    "src/safety/control_flow_monitor.c",
+    "src/radar/radar_control.c",
+    "src/radar/chirp_config.c",
+    "src/radar/data_acquisition.c",
+    "src/calibration/tx_power_cal.c",
+    "src/calibration/rx_gain_phase_cal.c",
+    "src/calibration/lo_leakage_cal.c",
+    "src/drivers/adc_driver.c",
+    "src/drivers/dac_driver.c",
+    "src/drivers/pll_driver.c",
+    "src/drivers/spi_driver.c",
+    "src/drivers/gpio_driver.c",
+    "src/rom/rom_patch.c",
+    "src/rom/trim_loader.c",
+    "src/hal/hal_interrupt.c",
+    "src/hal/hal_timer.c",
+    "src/hal/hal_dma.c",
+]
+
+ASM_SOURCES = [
+    "src/startup/vector_table.S",
+    "asm/critical_section.S",
+    "asm/cache_ops.S",
+]
+
+INCLUDE_PATHS = [
+    "include",
+    "src",
+    "src/safety",
+    "src/radar",
+    "src/calibration",
+    "src/drivers",
+    "src/rom",
+    "src/hal",
+]
+
+
+def find_toolchain(use_ti_cgt: bool) -> dict:
+    """Locate the compiler toolchain."""
+    if use_ti_cgt and os.path.isdir(DEFAULT_CGT_PATH):
+        return {
+            "cc": os.path.join(DEFAULT_CGT_PATH, "bin", "armcl"),
+            "asm": os.path.join(DEFAULT_CGT_PATH, "bin", "armasm"),
+            "ld": os.path.join(DEFAULT_CGT_PATH, "bin", "armlnk"),
+            "objcopy": os.path.join(DEFAULT_CGT_PATH, "bin", "armobjcopy"),
+            "type": "ti-cgt",
+        }
+    else:
+        prefix = DEFAULT_GNU_PREFIX
+        return {
+            "cc": f"{prefix}gcc",
+            "asm": f"{prefix}as",
+            "ld": f"{prefix}gcc",
+            "objcopy": f"{prefix}objcopy",
+            "type": "gnu-arm",
+        }
+
+
+def get_cflags(config: str, safety_level: str) -> list:
+    """Build compiler flags based on configuration."""
+    flags = [
+        "-mcpu=cortex-r5", "-mthumb",
+        "-mfloat-abi=hard", "-mfpu=vfpv3-d16",
+        "-Wall", "-Wextra", "-Werror",
+        "-std=c99",
+        "-ffunction-sections", "-fdata-sections",
+        "-DTARGET_AWR2944",
+    ]
+
+    for inc in INCLUDE_PATHS:
+        flags.append(f"-I{inc}")
+
+    if config == "release":
+        flags.extend(["-O2", "-DNDEBUG"])
+    elif config == "debug":
+        flags.extend(["-O0", "-g", "-gdwarf-3", "-DDEBUG"])
+    else:
+        flags.extend(["-O1", "-g"])
+
+    if safety_level in ("asil-d", "sil-3"):
+        flags.extend([
+            "-DSAFETY_BUILD=1",
+            "-DSAFETY_CHECKS_ENABLED=1",
+        ])
+
+    return flags
+
+
+def compile_sources(toolchain: dict, cflags: list) -> list:
+    """Compile all C and ASM source files."""
+    obj_files = []
+
+    for src in C_SOURCES:
+        obj = BUILD_DIR / src.replace(".c", ".o")
+        obj.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [toolchain["cc"]] + cflags + ["-c", "-o", str(obj), src]
+        print(f"  [CC] {src}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"ERROR: {result.stderr}")
+            sys.exit(1)
+        obj_files.append(str(obj))
+
+    for src in ASM_SOURCES:
+        obj = BUILD_DIR / src.replace(".S", ".o")
+        obj.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [toolchain["cc"], "-mcpu=cortex-r5", "-mthumb",
+               "-c", "-o", str(obj), src]
+        print(f"  [AS] {src}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"ERROR: {result.stderr}")
+            sys.exit(1)
+        obj_files.append(str(obj))
+
+    return obj_files
+
+
+def link_firmware(toolchain: dict, obj_files: list) -> str:
+    """Link object files into final ELF."""
+    elf_path = str(BUILD_DIR / f"{PROJECT_NAME}.elf")
+    map_path = str(BUILD_DIR / f"{PROJECT_NAME}.map")
+    linker_script = str(LINKER_DIR / "awr2944_r5f.lds")
+
+    cmd = [
+        toolchain["ld"],
+        "-mcpu=cortex-r5", "-mthumb",
+        "-mfloat-abi=hard", "-mfpu=vfpv3-d16",
+        f"-T{linker_script}",
+        "-Wl,--gc-sections",
+        f"-Wl,-Map={map_path}",
+        "-nostartfiles",
+        "-o", elf_path,
+    ] + obj_files + ["-lm", "-lc", "-lgcc"]
+
+    print(f"  [LD] {elf_path}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: {result.stderr}")
+        sys.exit(1)
+
+    return elf_path
+
+
+def generate_binary(toolchain: dict, elf_path: str):
+    """Generate binary and hex outputs."""
+    bin_path = elf_path.replace(".elf", ".bin")
+    hex_path = elf_path.replace(".elf", ".hex")
+
+    subprocess.run([toolchain["objcopy"], "-O", "binary", elf_path, bin_path])
+    subprocess.run([toolchain["objcopy"], "-O", "ihex", elf_path, hex_path])
+
+    print(f"  [BIN] {bin_path}")
+    print(f"  [HEX] {hex_path}")
+
+
+def clean():
+    """Remove build directory."""
+    if BUILD_DIR.exists():
+        shutil.rmtree(BUILD_DIR)
+        print("Build directory cleaned.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AWR2944 Firmware Build Script")
+    parser.add_argument("--target", default="awr2944", help="Target platform")
+    parser.add_argument("--config", default="release", choices=["debug", "release", "profile"])
+    parser.add_argument("--safety-level", default="asil-d", choices=["qm", "asil-a", "asil-b", "asil-c", "asil-d", "sil-3"])
+    parser.add_argument("--clean", action="store_true", help="Clean build artifacts")
+    parser.add_argument("--test", choices=["unit", "integration", "qualification"], help="Run tests")
+    parser.add_argument("--ti-cgt", action="store_true", help="Use TI CGT toolchain")
+    args = parser.parse_args()
+
+    if args.clean:
+        clean()
+        return
+
+    print(f"Building {PROJECT_NAME} for {args.target} ({args.config}, {args.safety_level})")
+
+    toolchain = find_toolchain(args.ti_cgt)
+    print(f"Toolchain: {toolchain['type']}")
+
+    cflags = get_cflags(args.config, args.safety_level)
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    obj_files = compile_sources(toolchain, cflags)
+    elf_path = link_firmware(toolchain, obj_files)
+    generate_binary(toolchain, elf_path)
+
+    print(f"\n===== Build Complete: {elf_path} =====")
+
+
+if __name__ == "__main__":
+    main()

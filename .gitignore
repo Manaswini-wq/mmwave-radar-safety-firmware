@@ -1,0 +1,60 @@
+# Build artifacts
+build/
+out/
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.d
+*.i
+*.s
+
+# TI CGT specific
+*.pp
+*.asm
+*.crl
+*.doj
+*.out
+*.lib
+
+# IDE files
+.ccsproject
+.cproject
+.project
+.settings/
+*.launch
+.vscode/
+*.code-workspace
+
+# Debug
+*.dmp
+*.log
+debug/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# Coverage
+coverage/
+*.gcno
+*.gcda
+*.gcov
+lcov.info
+
+# Temporary
+*.tmp
+*.bak
+*.swp
+*~
